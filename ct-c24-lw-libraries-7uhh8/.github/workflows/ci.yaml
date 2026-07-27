@@ -1,0 +1,497 @@
+name: BuildTest
+
+on:
+  workflow_dispatch: 
+    inputs:
+      test1:
+        description: "[pos test] pos. delta (2 files + 1 file)"
+        default: true
+        type: boolean
+      test2:
+        description: "[pos test] neg. delta (2 files)"
+        default: true
+        type: boolean
+      test4:
+        description: "[neg test] Incorrect file (1 file 1 channel)"
+        default: true
+        type: boolean
+        
+      cf_block:
+          description: "[format] tests is failing when clang-format failed"
+          default: true
+          type: boolean   
+          
+      san:
+          description: "[experimental] use ASan sanitizer"
+          default: true
+          type: boolean   
+  
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  C_FLAG_CLANG: "-std=c2x"
+  C_ARGS2_CLANG: "-I.\\include -m64 -Wall -Wextra -Wpedantic -O2 -c -D _CRT_SECURE_NO_WARNINGS -D _USE_MATH_DEFINES -fno-omit-frame-pointer -fsanitize=undefined -fsanitize=address -fsanitize-trap=all "
+  C_ARGS_CLANG: "-I.\\include -m64 -Wall -Wextra -Wpedantic -O2 -c -D _CRT_SECURE_NO_WARNINGS -D _USE_MATH_DEFINES "
+  # clang: error: unsupported option '-fsanitize=memory' for target 'x86_64-pc-windows-msvc'
+  C_LINKER_CLANG: "clang "
+  C_LINKER_ARGS_CLANG: " -llibfftw3-3 -llibfftw3f-3 -llibfftw3l-3 -lavcodec -lavdevice -lavfilter -lavformat -lavutil -lpostproc -lswresample -lswscale -o "
+  C_LINKER_ARGS2_CLANG: " -llibfftw3-3 -llibfftw3f-3 -llibfftw3l-3 -lavcodec -lavdevice -lavfilter -lavformat -lavutil -lpostproc -lswresample -lswscale -l'clang_rt.asan-x86_64' -o "
+
+  C_FLAG_MSVC: "/std:c17"
+  C_ARGS_MSVC: "/W4 /O2 /MD /c /D_CRT_SECURE_NO_WARNINGS /D_USE_MATH_DEFINES /I.\\include "
+  C_ARGS_MSVC_SAN: "/W4 /O2 /MD /c /D_CRT_SECURE_NO_WARNINGS /D_USE_MATH_DEFINES /I.\\include /fsanitize=address /Zi "
+  C_LINKER_MSVC: "link "
+  C_LINKER_ARGS_MSVC: "/DYNAMICBASE libfftw3-3.lib libfftw3f-3.lib libfftw3l-3.lib avcodec.lib avdevice.lib avfilter.lib avformat.lib avutil.lib postproc.lib swresample.lib swscale.lib /RELEASE /MACHINE:X64 /SUBSYSTEM:CONSOLE /OUT:"
+  C_LINKER_ARGS_MSVC_SAN: "/DYNAMICBASE libfftw3-3.lib libfftw3f-3.lib libfftw3l-3.lib avcodec.lib avdevice.lib avfilter.lib avformat.lib avutil.lib postproc.lib swresample.lib swscale.lib /DEBUG /MACHINE:X64 /SUBSYSTEM:CONSOLE /OUT:"
+
+  C_FILES: " $((Get-ChildItem -Path . -Include @('*.c') -Recurse -ErrorAction SilentlyContinue -Force).FullName)"
+  O_FILES: " $((Get-ChildItem -Path . -Filter '*.o' -ErrorAction SilentlyContinue -Force).FullName)"
+  OBJ_FILES: " $((Get-ChildItem -Path . -Filter '*.obj' -ErrorAction SilentlyContinue -Force).FullName)"
+  
+  BUILDLOG: "build.log"
+  WRONG_CLANG_FORMAT: 0
+
+jobs:
+  buildtest:    
+    if: >-
+      contains(fromJSON('["26046784", "96750568", "48153570", "44366841", "49571700"]'), github.actor_id) 
+      || (github.run_number <= fromJSON(vars.RUN_NUMBER))
+    strategy:
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        os: [windows-latest] #ubuntu-22.04, 
+        compiler: [cl, clang]
+    
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 6
+    env:    
+      EXE: __test.exe
+      SAN_EXE: __san_test.exe
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          submodules: 'true'
+             
+      - name: print_inputs
+        id: print_inputs
+        run: | 
+          echo "# Inputs" >> $env:GITHUB_STEP_SUMMARY
+          echo " '[pos test] pos. delta (2 files + 1 file) == $${{inputs.test1}}" >> $env:GITHUB_STEP_SUMMARY
+          echo " '[pos test] neg. delta (2 files) == $${{inputs.test2}}" >> $env:GITHUB_STEP_SUMMARY
+          echo " '[neg test] Incorrect file (1 file 1 channel) == $${{inputs.test4}}" >> $env:GITHUB_STEP_SUMMARY
+          echo " '[format] tests is failing when clang-format failed == $${{inputs.cf_block}}" >> $env:GITHUB_STEP_SUMMARY
+          echo " '[experimental] use ASan sanitizer == $${{inputs.san}}" >> $env:GITHUB_STEP_SUMMARY
+          echo "fromJSON(vars.RUN_NUMBER) == ${{fromJSON(vars.RUN_NUMBER)}}"
+                    
+      - name: detect_lang
+        id: detect_lang
+        run: | 
+          echo "# Detect language" >> $env:GITHUB_STEP_SUMMARY
+          $ErrorActionPreference = 'SilentlyContinue'
+          $c = Get-ChildItem -Force -File -Name main.c
+
+          "::group::debug info"
+          echo "c=$c $($c.GetType()) $($c.GetType() -eq [String])"
+          "::endgroup::" 
+
+          if ($c.GetType() -eq [String])
+          {
+              $version = $(clang --version) -join "`n"
+              echo "Detect ✅: C">> $env:GITHUB_STEP_SUMMARY
+                echo "lang=2" >> $env:GITHUB_OUTPUT      
+              exit(0)
+          }
+          echo "Detect failed ❌">> $env:GITHUB_STEP_SUMMARY             
+          exit(1)
+          
+      - name: setup-cpp
+        if: ${{ contains(matrix.os, 'ubuntu_disable') }}
+        uses: aminya/setup-cpp@v0.37.0
+        with:
+          compiler: llvm-17.0.0
+          vcvarsall: ${{ contains(matrix.os, 'windows') }}        
+      
+      - name: clang_format
+        id: clang_format
+        if: matrix.compiler == 'clang'
+        run: |          
+          echo "# clang-format" >> $env:GITHUB_STEP_SUMMARY
+          clang-format --version 2>&1 | tee cl_log.txt
+          
+          $a = Get-ChildItem -Recurse -Force -File -Name -LiteralPath '.' -Include @('*.c', '*.h') | Where-Object { $_ -notlike 'return_codes.h' }
+
+          echo "    Checking formating files: $a
+                    ">> $env:GITHUB_STEP_SUMMARY
+          clang-format --dry-run --style=file $a 2>&1 | tee log.txt
+
+          echo "clang-format version:">> $env:GITHUB_STEP_SUMMARY 
+                echo '```' >> $env:GITHUB_STEP_SUMMARY
+                $(Get-Content cl_log.txt -Raw) >> $env:GITHUB_STEP_SUMMARY
+                echo '```' >> $env:GITHUB_STEP_SUMMARY
+          if (-not (Test-Path -Path log.txt -PathType leaf) -or (Get-ChildItem -Path log.txt).Length -eq 0) 
+          {
+            echo "OK ✅">> $env:GITHUB_STEP_SUMMARY
+            "WRONG_CLANG_FORMAT=0" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+          else
+          {
+            echo "!OK ❌">> $env:GITHUB_STEP_SUMMARY  
+            echo "<details><summary>Full log</summary>`n" >> $env:GITHUB_STEP_SUMMARY  
+                echo '```' >> $env:GITHUB_STEP_SUMMARY
+                $(Get-Content log.txt -Raw) >> $env:GITHUB_STEP_SUMMARY
+                echo '```' >> $env:GITHUB_STEP_SUMMARY
+            echo "`n</details>`n`n" >> $env:GITHUB_STEP_SUMMARY  
+            "WRONG_CLANG_FORMAT=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+
+      - uses: TheMrMilchmann/setup-msvc-dev@v3
+        name: setup-msvc-dev        
+        with:
+          arch: x64
+          
+      - name: setup-libs
+        id: setup-libs      
+        run: |
+            Write-Output "::group::ffmpeg"
+            
+            Invoke-WebRequest "https://github.com/GyanD/codexffmpeg/releases/download/6.1.1/ffmpeg-6.1.1-full_build-shared.7z" -OutFile ffmpeg-6.1.1.7z
+            & "C:\Program Files\7-Zip\7z.exe" x "ffmpeg-6.1.1.7z"
+            
+            $ffmpeg_path = (Resolve-Path -Path ".\ffmpeg-6.1.1-full_build-shared").Path
+            echo "ffmpeg_path=$ffmpeg_path" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "$($ffmpeg_path)\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+           
+            Write-Output "::endgroup::"
+            
+            Write-Output "::group::fftw3"
+            mkdir fftw3
+            cd fftw3
+            
+            Invoke-WebRequest "https://fftw.org/pub/fftw/fftw-3.3.5-dll64.zip" -OutFile fftw-3.3.5-dll64.zip
+            & "C:\Program Files\7-Zip\7z.exe" x "fftw-3.3.5-dll64.zip"  
+            $fftw3_path = (Resolve-Path -Path ".").Path
+            echo "fftw3_path=$fftw3_path" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "$fftw3_path" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+            lib /def:libfftw3-3.def /MACHINE:X64
+            lib /def:libfftw3f-3.def /MACHINE:X64
+            lib /def:libfftw3l-3.def /MACHINE:X64
+            cd ..
+            Write-Output "::endgroup::"
+
+            Write-Output "::group::dirs"
+            Get-ChildItem -Path "." -Recurse
+            Write-Output "::endgroup::"
+
+      
+      - name: sanitize
+        id: sanitize
+        if: matrix.compiler == 'cl' && inputs.san
+        run: |   
+          $build_exit_code = 0  
+          echo "# [experimental] Run with sanitizer (test 1)" >> $env:GITHUB_STEP_SUMMARY
+          
+          try 
+          {
+            $ErrorActionPreference = 'SilentlyContinue'
+            #$version = (${{ matrix.compiler }} --version)
+            #Set-PSDebug -Trace 1
+            $print_args = ""
+                        
+              $print_args = "${{ env.C_ARGS_MSVC_SAN }}"
+             
+              Write-Output "::group::compiling"
+                echo "${{ matrix.compiler }} /I${{steps.setup-libs.outputs.ffmpeg_path}}\include /I${{steps.setup-libs.outputs.fftw3_path}} ${{ env.C_FLAG_MSVC }} ${{ env.C_ARGS_MSVC_SAN }} ${{ env.C_FILES }} " 
+                & ${{ matrix.compiler }} /I${{steps.setup-libs.outputs.ffmpeg_path}}\include /I${{steps.setup-libs.outputs.fftw3_path}} ${{ env.C_FLAG_MSVC }} ${{ env.C_ARGS_MSVC_SAN }} ${{ env.C_FILES }} *>&1 > ${{ env.BUILDLOG }}
+              Write-Output "::endgroup::"
+              
+              $build_exit_code += [int]$LastExitCode
+                           
+              Write-Output "::group::linking"  
+              echo "${{ env.OBJ_FILES }}"                           
+                echo "${{ env.C_LINKER_MSVC }} ${{ env.OBJ_FILES }} /LIBPATH:${{steps.setup-libs.outputs.ffmpeg_path}}\lib /LIBPATH:${{steps.setup-libs.outputs.fftw3_path}} ${{ env.C_LINKER_ARGS_MSVC_SAN }}${{ env.SAN_EXE }}"
+                & ${{ env.C_LINKER_MSVC }} ${{ env.OBJ_FILES }} /LIBPATH:${{steps.setup-libs.outputs.ffmpeg_path}}\lib /LIBPATH:${{steps.setup-libs.outputs.fftw3_path}} ${{ env.C_LINKER_ARGS_MSVC_SAN }}${{ env.SAN_EXE }} *>&1 >> ${{ env.BUILDLOG }}
+              Write-Output "::endgroup::"
+                             
+              $build_exit_code += [int]$LastExitCode
+          } 
+          catch 
+          {
+            $build_exit_code = $LastExitCode
+            Write-Output "❌ build failed!"
+            echo "Build exit code: $([int]$LastExitCode)" >> $env:GITHUB_STEP_SUMMARY
+            exit($build_exit_code)
+          } 
+          finally 
+          {
+            $blog = "$(Get-Content ${{ env.BUILDLOG }} -Raw)"
+            $blog = if($blog -eq "") { '<emplty>' } else { $blog }
+            $blog1 = $blog.replace("`nMicrosoft (R)", "`n`nMicrosoft (R)")
+
+            echo "## Build log (with sanitizer):" >> $env:GITHUB_STEP_SUMMARY
+            
+              #echo "Compiler:" >> $env:GITHUB_STEP_SUMMARY
+              #echo '```' >> $env:GITHUB_STEP_SUMMARY
+              #$version >> $env:GITHUB_STEP_SUMMARY
+              #echo '```' >> $env:GITHUB_STEP_SUMMARY
+            
+            echo "Compile with args:" >> $env:GITHUB_STEP_SUMMARY
+            echo '```' >> $env:GITHUB_STEP_SUMMARY
+            $print_args >> $env:GITHUB_STEP_SUMMARY
+            echo '```' >> $env:GITHUB_STEP_SUMMARY
+            
+              echo '```' >> $env:GITHUB_STEP_SUMMARY
+              "$blog1" >> $env:GITHUB_STEP_SUMMARY
+              echo '```' >> $env:GITHUB_STEP_SUMMARY
+              
+            "::group::Build log"
+            echo $blog1
+            ls
+            echo "::endgroup::" 
+
+            if ($build_exit_code -eq 0 )
+            {
+              Copy-Item -Path "${{steps.setup-libs.outputs.ffmpeg_path}}\bin\*" -Filter *.dll -Destination "." -Force
+              Copy-Item -Path "${{steps.setup-libs.outputs.fftw3_path}}\*" -Filter *.dll -Destination "." -Force  
+
+              set ASAN_OPTIONS=verbose=0:detect_stack_use_after_return=1:alloc_dealloc_mismatch=1:halt_on_error=0:debug=1:check_initialization_order=1:print_stats=1
+                
+              Write-Output "::group::sanitize"
+                $processOptions = @{
+                    FilePath = "${{ env.SAN_EXE }}"
+                    ArgumentList = "./test_data/rickroll354_1.mp3 ./test_data/rickroll354_cutted.mp3"
+                    RedirectStandardOutput = "tlog.txt"
+                    RedirectStandardError = "elog.txt"
+                    NoNewWindow = $true
+                    PassThru = $true
+                }
+                $p = Start-Process @processOptions
+                Wait-Process -InputObject $p       
+                $test_exit_code = [int]$p.ExitCode
+                
+                echo "Test with sanitize log" >> $env:GITHUB_STEP_SUMMARY 
+                echo '```' >> $env:GITHUB_STEP_SUMMARY
+                (Get-Content "tlog.txt") >> $env:GITHUB_STEP_SUMMARY
+                echo '```' >> $env:GITHUB_STEP_SUMMARY
+                
+                echo "Test with sanitize error log" >> $env:GITHUB_STEP_SUMMARY 
+                echo '```' >> $env:GITHUB_STEP_SUMMARY
+                (Get-Content "elog.txt") >> $env:GITHUB_STEP_SUMMARY
+                echo '```' >> $env:GITHUB_STEP_SUMMARY
+              
+                "::group::test log"
+                Write-Output (Get-Content "tlog.txt")
+                echo "::endgroup::" 
+                
+                "::group::test error log"   
+                Write-Output (Get-Content "elog.txt") 
+                echo "::endgroup::"    
+              Write-Output "::endgroup::"
+              
+              Write-Output "::group::dirs"
+              Get-ChildItem -Path "." -Recurse
+              Write-Output "::endgroup::"
+            }
+          }
+
+          exit($build_exit_code + -not (& Test-Path -Path ${{ env.SAN_EXE }} -PathType Leaf) + $test_exit_code + ((Get-Content "elog.txt").Length -gt 3))
+        
+      - name: build
+        id: build
+        run: |   
+          $build_exit_code = 0  
+          
+          try 
+          {
+            $ErrorActionPreference = 'SilentlyContinue'
+            $version = ""
+            #Set-PSDebug -Trace 1
+            $print_args = ""
+            
+            if ('${{ matrix.compiler }}' -eq 'cl')
+            {
+              $print_args = "${{ env.C_ARGS_MSVC }}"
+              #$version = (${{ matrix.compiler }})
+              
+              Write-Output "::group::compiling"
+                echo "${{ matrix.compiler }} /I${{steps.setup-libs.outputs.ffmpeg_path}}\include /I${{steps.setup-libs.outputs.fftw3_path}} ${{ env.C_FLAG_MSVC }} ${{ env.C_ARGS_MSVC }} ${{ env.C_FILES }} " 
+                & ${{ matrix.compiler }} /I${{steps.setup-libs.outputs.ffmpeg_path}}\include /I${{steps.setup-libs.outputs.fftw3_path}} ${{ env.C_FLAG_MSVC }} ${{ env.C_ARGS_MSVC }} ${{ env.C_FILES }} *>&1 > ${{ env.BUILDLOG }}
+              Write-Output "::endgroup::"
+                           
+              Write-Output "::group::linking"  
+              echo "${{ env.OBJ_FILES }}"                           
+                echo "${{ env.C_LINKER_MSVC }} ${{ env.OBJ_FILES }} /LIBPATH:${{steps.setup-libs.outputs.ffmpeg_path}}\lib /LIBPATH:${{steps.setup-libs.outputs.fftw3_path}} ${{ env.C_LINKER_ARGS_MSVC }}${{ env.EXE }}"
+                & ${{ env.C_LINKER_MSVC }} ${{ env.OBJ_FILES }} /LIBPATH:${{steps.setup-libs.outputs.ffmpeg_path}}\lib /LIBPATH:${{steps.setup-libs.outputs.fftw3_path}} ${{ env.C_LINKER_ARGS_MSVC }}${{ env.EXE }} *>&1 >> ${{ env.BUILDLOG }}
+              Write-Output "::endgroup::"
+            } 
+            else
+            {
+              $print_args = "${{ env.C_ARGS_CLANG }}"  
+              $version = (${{ matrix.compiler }} --version)
+              
+              Write-Output "::group::compiling"
+                echo "${{ matrix.compiler }} -I${{steps.setup-libs.outputs.ffmpeg_path}}\include -I${{steps.setup-libs.outputs.fftw3_path}} ${{ env.C_FLAG_CLANG }} ${{ env.C_ARGS_CLANG }} ${{ env.C_FILES }} " 
+                & ${{ matrix.compiler }} -I${{steps.setup-libs.outputs.ffmpeg_path}}\include -I${{steps.setup-libs.outputs.fftw3_path}} ${{ env.C_FLAG_CLANG }} ${{ env.C_ARGS_CLANG }} ${{ env.C_FILES }} *>&1 > ${{ env.BUILDLOG }}
+              Write-Output "::endgroup::"
+                           
+              Write-Output "::group::linking"  
+              echo "${{ env.O_FILES }}"                           
+                echo "${{ env.C_LINKER_CLANG }} ${{ env.O_FILES }} -L ${{steps.setup-libs.outputs.ffmpeg_path}}\lib -L ${{steps.setup-libs.outputs.fftw3_path}} ${{ env.C_LINKER_ARGS_CLANG }}${{ env.EXE }}"
+                & ${{ env.C_LINKER_CLANG }} ${{ env.O_FILES }} -L ${{steps.setup-libs.outputs.ffmpeg_path}}\lib -L ${{steps.setup-libs.outputs.fftw3_path}} ${{ env.C_LINKER_ARGS_CLANG }}${{ env.EXE }} *>&1 >> ${{ env.BUILDLOG }}
+              Write-Output "::endgroup::"
+            }      
+            
+            Copy-Item -Path "${{steps.setup-libs.outputs.ffmpeg_path}}\bin\*" -Filter *.dll -Destination "." -Force
+            Copy-Item -Path "${{steps.setup-libs.outputs.fftw3_path}}\*" -Filter *.dll -Destination "." -Force  
+              
+            Write-Output "::group::dirs"
+            Get-ChildItem -Path "." -Recurse
+            Write-Output "::endgroup::"
+          } 
+          catch 
+          {
+            $build_exit_code = $LastExitCode
+            Write-Output "❌ build failed!"
+            echo "Build exit code: $([int]$LastExitCode)" >> $env:GITHUB_STEP_SUMMARY
+            exit($build_exit_code)
+          } 
+          finally 
+          {
+            $blog = "$(Get-Content ${{ env.BUILDLOG }} -Raw)"
+            $blog = if($blog -eq "") { '<emplty>' } else { $blog }
+            $blog1 = $blog.replace("`nMicrosoft (R)", "`n`nMicrosoft (R)")
+
+            echo "# Build log" >> $env:GITHUB_STEP_SUMMARY
+            if ($version -ne "")
+            {
+              echo "Compiler:" >> $env:GITHUB_STEP_SUMMARY
+              echo '```' >> $env:GITHUB_STEP_SUMMARY
+              $version >> $env:GITHUB_STEP_SUMMARY
+              echo '```' >> $env:GITHUB_STEP_SUMMARY
+            }            
+            echo "Compile with args:" >> $env:GITHUB_STEP_SUMMARY
+            echo '```' >> $env:GITHUB_STEP_SUMMARY
+            $print_args >> $env:GITHUB_STEP_SUMMARY
+            echo '```' >> $env:GITHUB_STEP_SUMMARY
+            echo '```' >> $env:GITHUB_STEP_SUMMARY
+            "$blog1" >> $env:GITHUB_STEP_SUMMARY
+            echo '```' >> $env:GITHUB_STEP_SUMMARY
+              
+            "::group::Build log"
+            echo $blog1
+            ls
+            echo "::endgroup::" 
+          }
+
+          exit($build_exit_code + -not (& Test-Path -Path ${{env.EXE}} -PathType Leaf))
+          
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10' # win default 3.9
+          check-latest: true
+          cache: 'pip' # caching pip dependencies
+
+      - name: pretest
+        id: pretest
+        run: |
+          $ErrorActionPreference = 'SilentlyContinue'
+          #pip install -r ".github/requirements.txt"
+          pip install -r "suite/requirements.txt"
+                               
+      - name: tests
+        id: tests
+        run: | 
+            "::group::ls"
+            ls
+            echo "::endgroup::" 
+            
+            $test4 = if ($${{inputs.test4}}) { "negative_test" } else { "" }
+            $test1 = if ($${{inputs.test1}} -and -not $${{inputs.test2}}) { "positive_test positive_delta" } else { "" }
+            $test2 = if ($${{inputs.test2}} -and -not $${{inputs.test1}}) { "positive_test negative_delta" } else { "" }
+            $test3 = if ($${{inputs.test1}} -and $${{inputs.test2}}) { "positive_test positive_delta negative_delta" } else { "" }
+
+            echo "RUN: python tests.py ${{env.EXE}} $test1 $test2 $test3 $test4"
+            
+            $processOptions = @{
+                FilePath = "python"
+                ArgumentList = "tests.py ${{env.EXE}} $test1 $test2 $test3 $test4"
+                RedirectStandardOutput = "tlog.txt"
+                RedirectStandardError = "elog.txt"
+                NoNewWindow = $true
+                PassThru = $true
+            }
+            $p = Start-Process @processOptions
+            Wait-Process -InputObject $p       
+            $test_exit_code = [int]$p.ExitCode
+            
+            echo "# Test log" >> $env:GITHUB_STEP_SUMMARY   
+            
+              "::group::test log"
+              Write-Output (Get-Content "tlog.txt")
+              echo "::endgroup::" 
+              
+              "::group::test error log"   
+              Write-Output (Get-Content "elog.txt") 
+              echo "::endgroup::"     
+  
+            if ($test_exit_code -eq 0) 
+            {
+              echo '```' >> $env:GITHUB_STEP_SUMMARY
+              "✅ PASSED" >> $env:GITHUB_STEP_SUMMARY
+              echo '```' >> $env:GITHUB_STEP_SUMMARY     
+            }
+            else
+            {
+              echo '```' >> $env:GITHUB_STEP_SUMMARY
+              "❌ FAILED [output != expected, see logs]" >> $env:GITHUB_STEP_SUMMARY 
+              echo '```' >> $env:GITHUB_STEP_SUMMARY   
+            }
+            
+            #echo "<details><summary>Full log</summary>`n" >> $env:GITHUB_STEP_SUMMARY  
+            echo "Full log" >> $env:GITHUB_STEP_SUMMARY     
+              echo '```' >> $env:GITHUB_STEP_SUMMARY 
+              (Get-Content "tlog.txt") >> $env:GITHUB_STEP_SUMMARY        
+              echo '```' >> $env:GITHUB_STEP_SUMMARY
+            #echo "`n</details>`n`n" >> $env:GITHUB_STEP_SUMMARY  
+  
+            echo "Test error log" >> $env:GITHUB_STEP_SUMMARY       
+              echo '```' >> $env:GITHUB_STEP_SUMMARY 
+              (Get-Content "elog.txt") >> $env:GITHUB_STEP_SUMMARY        
+              echo '```' >> $env:GITHUB_STEP_SUMMARY
+  
+            exit($test_exit_code)
+                
+      - name: summary
+        id: summary
+        if: ${{ always() }}
+        run: |
+          echo "steps: ${{ toJson(steps) }}"
+          echo "matrix: ${{ toJson(matrix) }}"
+          echo "job: ${{ toJson(job) }}"
+          $cf = $${{ steps.clang_format.conclusion == 'skipped' }} -or (1 - (-not ($${{ steps.clang_format.conclusion == 'success' }}) + $env:WRONG_CLANG_FORMAT * $${{ inputs.cf_block }}))
+          $san = $${{ steps.sanitize.conclusion == 'skipped' }} -or $${{ steps.sanitize.conclusion == 'success' }}
+          $total = $${{ steps.detect_lang.conclusion == 'success' }} + $cf + $san + $${{ steps.build.conclusion == 'success' }} + $${{ steps.tests.conclusion == 'success' }}
+          echo "$${{ steps.detect_lang.conclusion == 'success' }} + $cf + $san + $${{ steps.build.conclusion == 'success' }} + $${{ steps.tests.conclusion == 'success' }}"
+          $all_checks = 4+1
+          
+          echo "# ${{ matrix.os }} ${{ matrix.compiler }} summary" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          echo "detect_lang  : $(if ($${{ steps.detect_lang.conclusion == 'success' }}) {" success" } else { " failure" })" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          if (-not $${{ steps.clang_format.conclusion == 'skipped' }}) { echo "clang-format : $(if ($env:WRONG_CLANG_FORMAT -eq 0) {"✅ success" } else { "❌ failure" }) : is_blocking == $${{ inputs.cf_block }}" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append }
+          if (-not $${{ steps.sanitize.conclusion == 'skipped' }}) { echo "sanitize : $(if ($${{ steps.sanitize.conclusion == 'success' }}) {"✅ success" } else { "❌ failure" })" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append }
+          echo "build        : $(if ($${{ steps.build.conclusion == 'success' }}) {"✅ success" } else { "❌ failure" })" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          echo "tests        : $(if ($${{ steps.tests.conclusion == 'success' }}) {"✅ success" } else { "❌ failure" })" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          echo "TOTAL        : $(if ($total -eq $all_checks) { "✅ success" } else { "❌ failure" })" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+          if ($${{ steps.print_inputs.conclusion != 'success' }})
+          {
+            echo "⚠️ Init repo failed. Contact your teacher (Viktoria Yakovleva) for support." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
+                    
+          exit($total -ne $all_checks)
+      

@@ -1,0 +1,213 @@
+name: BuildTest
+
+on:
+  workflow_dispatch: 
+  
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  #C_LINUX: "clang++"
+  C_FLAG_LINUX: "-std=c2x"
+  CPP_FLAG_LINUX: "-std=c++20"
+  C_ARGS_LINUX: "-O2 -Werror=return-type -Werror=strict-prototypes -Wvla -Wunused-variable -lm -o "
+  
+  #C_WINDOWS: "cl.exe"
+  # -Wno-deprecated-non-prototype  - WinClang15
+  C_FLAG_WINDOWS: "/std:c17"
+  CPP_FLAG_WINDOWS: "/std:c++latest "
+  C_ARGS_WINDOWS: "-D _CRT_SECURE_NO_WARNINGS -D _USE_MATH_DEFINES -O2 /Fe:"
+
+  C_FILES: " -I./include -I./inc $((Get-ChildItem -Path . -Include @('*.c', '*.cpp') -Recurse -ErrorAction SilentlyContinue -Force).FullName)"
+  
+  BUILDLOG: "build.log"
+
+jobs:
+  buildtest:    
+    if: contains(fromJSON('["26046784", "96750568", "48153570", "44366841", "49571700"]'), github.actor_id) || (github.run_number < 14) ## https://api.github.com/users/
+    strategy:
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        os: [ubuntu-22.04, windows-latest] #
+        compiler: [clang-15, cl]
+        exclude:
+          - os: ubuntu-22.04
+            compiler: cl
+          - os: windows-latest
+            compiler: clang-15
+    
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 4
+    env:    
+      EXE: __test.exe
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+             
+      - name: detect_lang
+        id: detect_lang
+        run: | 
+          echo "# Detect language" >> $env:GITHUB_STEP_SUMMARY
+          $ErrorActionPreference = 'SilentlyContinue'
+          $cpp = Get-ChildItem -Force -File -Name main.cpp
+          $c = Get-ChildItem -Force -File -Name main.c
+
+          "::group::debug info"
+          echo "cpp=$cpp $($cpp.GetType()) $($cpp.GetType() -eq [String])"
+          echo "c=$c $($c.GetType()) $($c.GetType() -eq [String])"
+          "::endgroup::" 
+
+          if ($c.GetType() -eq [String])
+          {
+              $version = $(clang --version) -join "`n"
+              echo "Detect ✅: C">> $env:GITHUB_STEP_SUMMARY
+                echo "lang=2" >> $env:GITHUB_OUTPUT      
+              exit(0)
+          }
+          echo "Detect failed ❌">> $env:GITHUB_STEP_SUMMARY             
+          exit(1)
+          
+      - name: setup-cpp
+        if: ${{ contains(matrix.os, 'ubuntu123') }}
+        uses: aminya/setup-cpp@v1
+        with:
+          compiler: llvm-17.0.0
+          vcvarsall: ${{ contains(matrix.os, 'windows') }}        
+      
+      - name: clang_format
+        id: clang_format
+        if: matrix.os != 'windows-latest'
+        run: |
+          
+          echo "# clang-format" >> $env:GITHUB_STEP_SUMMARY
+          clang-format-15 --version 2>&1 | tee cl_log.txt
+          
+          $a = Get-ChildItem -Recurse -Force -File -Name -LiteralPath '.' -Include @('*.c', '*.h') | Where-Object { $_ -notlike 'return_codes.h' }
+
+          echo "    Checking formating files: $a
+                    ">> $env:GITHUB_STEP_SUMMARY
+          clang-format-15 --dry-run --style=file $a 2>&1 | tee log.txt
+
+          echo "clang-format version:">> $env:GITHUB_STEP_SUMMARY 
+                echo '```' >> $env:GITHUB_STEP_SUMMARY
+                $(Get-Content cl_log.txt -Raw) >> $env:GITHUB_STEP_SUMMARY
+                echo '```' >> $env:GITHUB_STEP_SUMMARY
+          if ((Get-ChildItem -Path log.txt).Length -eq 0) 
+          {
+            echo "OK ✅">> $env:GITHUB_STEP_SUMMARY
+          }
+          else
+          {
+            echo "!OK ❌">> $env:GITHUB_STEP_SUMMARY  
+                echo '```' >> $env:GITHUB_STEP_SUMMARY
+                $(Get-Content log.txt -Raw) >> $env:GITHUB_STEP_SUMMARY
+                echo '```' >> $env:GITHUB_STEP_SUMMARY
+          }
+          
+      - name: build
+        id: build
+        run: |   
+          echo "#### checking commit: $(git log -n1)" >> $env:GITHUB_STEP_SUMMARY  
+          
+          try 
+          {
+            $ErrorActionPreference = 'SilentlyContinue'
+            $version = ""
+            
+            if ('${{ matrix.os }}' -eq 'windows-latest') 
+            {
+              Push-Location
+              & 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\Launch-VsDevShell.ps1'
+              #& 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat'
+              Pop-Location
+
+              if (${{ steps.detect_lang.outputs.lang }} -eq 2)  #C
+              { & ${{ matrix.compiler }} ${{env.C_FLAG_WINDOWS}}  ${{env.C_ARGS_WINDOWS}} ${{env.EXE}} ${{env.C_FILES}} *>&1 > ${{env.BUILDLOG}} }
+              else
+              { & ${{ matrix.compiler }} ${{env.CPP_FLAG_WINDOWS}}  ${{env.C_ARGS_WINDOWS}} ${{env.EXE}} ${{env.C_FILES}} *>&1 > ${{env.BUILDLOG}} }
+            } 
+            else 
+            {
+              $version = $(${{ matrix.compiler }} --version) -join "`n"              
+              # print cm version
+              echo '```' >> $env:GITHUB_STEP_SUMMARY
+              echo "$($version)">> $env:GITHUB_STEP_SUMMARY
+              echo '```' >> $env:GITHUB_STEP_SUMMARY
+              
+              if (${{ steps.detect_lang.outputs.lang }} -eq 2)  #C
+              { & ${{ matrix.compiler }} ${{env.C_FLAG_LINUX}} ${{env.C_ARGS_LINUX}} ${{env.EXE}} ${{env.C_FILES}} *>&1 > ${{env.BUILDLOG}} }
+              else
+              { & ${{ matrix.compiler }}++ ${{env.CPP_FLAG_LINUX}} ${{env.C_ARGS_LINUX}} ${{env.EXE}} ${{env.C_FILES}} *>&1 > ${{env.BUILDLOG}} }
+            }    
+          } 
+          catch 
+          {
+            Write-Output "❌ build failed!"
+            echo "# Build: 
+               failed" >> $env:GITHUB_STEP_SUMMARY
+            echo "Build exit code: $LastExitCode" >> $env:GITHUB_STEP_SUMMARY
+            $blog="$(Get-Content "build.log" -Raw)"
+            echo "Build log: $blog" >> $env:GITHUB_STEP_SUMMARY 
+          } 
+          finally 
+          {
+            $blog="$(Get-Content "build.log" -Raw)"
+          
+            echo "# Build log:" >> $env:GITHUB_STEP_SUMMARY
+            echo '```' >> $env:GITHUB_STEP_SUMMARY
+            "$blog" >> $env:GITHUB_STEP_SUMMARY
+            echo '```' >> $env:GITHUB_STEP_SUMMARY
+            
+            "::group::Build log"
+            echo $blog
+            echo "::endgroup::"  
+          }
+                         
+      - name: tests
+        id: tests
+        run: | 
+          $processOptions = @{
+              FilePath = "python"
+              ArgumentList = "tests.py ${{env.EXE}}"
+              RedirectStandardOutput = "tlog.txt"
+              RedirectStandardError = "elog.txt"
+              NoNewWindow = $true
+              PassThru = $true
+          }
+          $p = Start-Process @processOptions
+          Wait-Process -InputObject $p       
+          $exit_code = [int]$p.ExitCode
+          
+          echo "# Test log" >> $env:GITHUB_STEP_SUMMARY    
+
+          if ($exit_code -eq 0) 
+          {
+                echo '```' >> $env:GITHUB_STEP_SUMMARY
+                "✅ PASSED" >> $env:GITHUB_STEP_SUMMARY
+                echo '```' >> $env:GITHUB_STEP_SUMMARY     
+          }
+          else
+          {
+                echo '```' >> $env:GITHUB_STEP_SUMMARY
+                "❌ FAILED [output != expected, see logs]" >> $env:GITHUB_STEP_SUMMARY 
+                echo '```' >> $env:GITHUB_STEP_SUMMARY   
+          }
+          
+          echo "<details><summary>Full log</summary>`n" >> $env:GITHUB_STEP_SUMMARY  
+            echo '```' >> $env:GITHUB_STEP_SUMMARY 
+            (Get-Content "tlog.txt") >> $env:GITHUB_STEP_SUMMARY        
+            echo '```' >> $env:GITHUB_STEP_SUMMARY
+          echo "`n</details>`n`n" >> $env:GITHUB_STEP_SUMMARY  
+
+          echo "### Test error log" >> $env:GITHUB_STEP_SUMMARY       
+            echo '```' >> $env:GITHUB_STEP_SUMMARY 
+            (Get-Content "elog.txt") >> $env:GITHUB_STEP_SUMMARY        
+            echo '```' >> $env:GITHUB_STEP_SUMMARY
+
+          exit($exit_code)
+          

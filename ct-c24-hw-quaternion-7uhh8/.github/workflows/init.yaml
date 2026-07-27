@@ -1,0 +1,209 @@
+name: init
+run-name: init (reviewer)
+
+on:
+  create:
+  workflow_call:
+    inputs:
+      add_attempts_var:
+        default: true
+        type: boolean
+      add_branch_pr:
+        default: true
+        type: boolean
+      callee_workflow:
+        default: true
+        type: boolean
+    secrets:
+      VAR_TOKEN:
+        description: 'A token passed from the caller workflow'
+        required: true
+  workflow_dispatch:
+    inputs:
+      add_attempts_var:
+        description: "Set variable for testing"
+        default: true
+        type: boolean
+      add_branch_pr:
+        description: "Create branch and PR"
+        default: false
+        type: boolean
+  
+defaults:
+  run:
+    shell: pwsh
+    
+env:
+  GITHUB_TOKEN: ${{ secrets.VAR_TOKEN }}
+  
+jobs: 
+  debug: 
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: |
+          echo "github.event_name: ${{github.event_name}}"
+          echo "github.actor_id: ${{github.actor_id}}"
+          echo "github.ref_name: ${{github.ref_name}}"
+          echo "github.ref_type: ${{github.ref_type}}"
+
+          echo "1: ${{ github.event_name == 'workflow_dispatch' && inputs.add_attempts_var && inputs.callee_workflow }}"
+          echo "1: ${{ github.event_name == 'workflow_dispatch' && inputs.add_attempts_var && contains(fromJSON('["26046784", "96750568", "48153570", "44366841", "49571700"]'), github.actor_id) }}"
+          echo "3: ${{ github.event_name == 'create' && github.ref_type == 'branch' && github.ref_name == 'main' }}"
+          echo "4: ${{ github.event_name == 'create' && github.ref_type == 'branch' && github.ref_name == 'feedback' }}"
+          
+          echo "inputs.add_attempts_var: $${{ inputs.add_attempts_var }}"
+          echo "inputs.add_branch_pr: $${{ inputs.add_branch_pr }}"
+          echo "event_name create: ${{ github.event_name == 'create' }}"
+          echo "ref_type branch: ${{ github.ref_type == 'branch' }}"
+          echo "ref_name feedback: ${{ github.ref_name == 'feedback' }}  main: ${{ github.ref_name == 'main' }}"
+          
+  add_var:
+    if: >-
+      ( github.event_name == 'workflow_dispatch' && inputs.add_attempts_var
+      && (inputs.callee_workflow || contains(fromJSON('["26046784", "96750568", "48153570", "44366841", "49571700"]'), github.actor_id)) )
+      || ( github.event_name == 'create' && github.ref_type == 'branch' && github.ref_name == 'main' )
+      
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: |
+          ## The token must have the following permission set:
+          ## actions_variables:write and environments:write          
+          $OWNER = '${{ github.repository_owner }}'
+          $REPO = '${{ github.event.repository.name }}'
+
+          $var_name = 'RUN_NUMBER'
+          $vari = ${{ vars.HW2_RUNS_PER_ATTEMPT }}
+          $vari
+          
+          $check_var = gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" `
+            /repos/$OWNER/$REPO/actions/variables/$var_name 
+            | ConvertFrom-JSON
+
+          $check_var
+            
+          if ($LastExitCode -eq 0)
+          {
+            Write-Host "Var '$var_name' exists with value $($check_var.value)`nValue will be set by default ($vari)"
+            gh api --method PATCH -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" `
+              /repos/$OWNER/$REPO/actions/variables/$var_name  `
+              -f name=$var_name `
+              -f value=$vari
+          }
+          else
+          {            
+            Write-Host "Create var '$var_name' with value $vari"
+            gh api --method POST -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" `
+              /repos/$OWNER/$REPO/actions/variables  `
+              -f name=$var_name `
+              -f value=$vari
+          }
+    
+  add_branch_pr:
+    if: >-
+      ( github.event_name == 'workflow_dispatch' && inputs.add_branch_pr
+      && (inputs.callee_workflow || contains(fromJSON('["26046784", "96750568", "48153570", "44366841", "49571700"]'), github.actor_id)) )
+      || ( github.event_name == 'create' && github.ref_type == 'branch' && github.ref_name == 'main' )
+      
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:            
+      - name: checkout
+        uses: actions/checkout@v4
+      
+      - name: add_branch_pr
+        run: |
+          ## The token must have the following permission set:
+          ## actions_variables:write and environments:write          
+          $OWNER = '${{ github.repository_owner }}'
+          $REPO = '${{ github.event.repository.name }}'
+          
+          $branches = gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" `
+              /repos/$OWNER/$REPO/branches 
+              | ConvertFrom-JSON
+
+          #$pr = (gh pr list).Count
+          $pr = gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" `
+              /repos/$OWNER/$REPO/pulls/1 
+              | ConvertFrom-JSON
+          $pr_not_found = $LastExitCode
+
+          $new_branch = if ($branches.Count -eq 1) { 'feedback' } else { 'feedback' }
+
+          if ($branches.Count -eq 1 -or $pr_not_found) # need 2 -- debug
+          {
+              Write-Host "Create feedback(3) branch + PR  manually"
+
+              git config user.name github-actions
+              git config user.email github-actions@github.com
+              
+              git checkout -b $new_branch
+              git push -u origin $new_branch
+              
+              $collaborators = gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" `
+                /repos/$OWNER/$REPO/collaborators 
+                | ConvertFrom-JSON
+              
+              git checkout main
+              New-Item ".github/.keep_" -type File -Force -Confirm:$false
+              git add ".github/.keep_"
+              git commit -a -m "Setting up GitHub Classroom Feedback"
+              git push origin main      
+
+              $collaborators = gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" `
+                /repos/$OWNER/$REPO/collaborators 
+                | ConvertFrom-JSON
+
+              $collaborators
+              
+              $user = ($collaborators | Where-Object {$_.role_name -ne "admin"} ).login
+              $user
+              
+              $PR = gh api --method POST -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28"  `
+                /repos/$OWNER/$REPO/pulls -f title="Feedback" `
+                -f body="It's a place for your teacher to leave feedback on your work. It will update automatically. Dont close or merge this pull request. In this pull request, your teacher will leave comments and feedback on your code. Click the Subscribe button to be notified if that happens. Subscribed: @$user" `
+                -f head="main" -f base=$new_branch  
+                | ConvertFrom-JSON
+
+              $PR
+          }   
+          else
+          {          
+              Write-Host "[OK] Feedback branch + PR created automatically"
+          }
+          
+  result:      
+    if: ${{ always() }}
+    needs: [add_var, add_branch_pr]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    env:
+      GH_CTX: ${{ toJSON(github) }}
+    steps:
+      - name: print_summary
+        run: |
+          if ('${{ github.event_name }}' -eq 'create')
+          {
+            if ('${{ needs.add_var.result }}' -eq 'skipped' -or '${{ needs.add_branch_pr.result }}' -eq 'skipped')
+            {
+              exit(10)
+            }
+          }
+          else
+          {
+            if ('${{ inputs.add_branch_pr }}' -eq 'false' -and '${{ inputs.add_attempts_var }}' -eq 'false')
+            {
+              exit(4)
+            }
+            if ('${{ needs.add_var.result }}' -eq 'skipped' -and '${{ inputs.add_attempts_var }}' -eq 'true')
+            {
+              exit(2)
+            }
+            if ('${{ needs.add_branch_pr.result }}' -eq 'skipped' -and '${{ inputs.add_branch_pr }}' -eq 'true')
+            {
+              exit(3)
+            }
+          }
+          
+          
